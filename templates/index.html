@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sweeper Coverage Path Planner — RL-ELM</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<style>
+  :root {
+    --bg: #0f1720; --panel: #16212c; --panel2: #1c2b38; --border: #2b3e4d;
+    --text: #e8eef3; --muted: #93a5b3; --accent: #3aa0ff; --accent2: #23c98f;
+    --warn: #ff9f43; --danger: #ff5c6c; --base-color: #ff9f43; --rl-color: #23c98f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  #app { display: flex; height: 100vh; width: 100vw; }
+  #sidebar { width: 360px; min-width: 320px; background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+  #map { flex: 1; }
+  h1 { font-size: 16px; margin: 0 0 2px 0; font-weight: 700; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .card { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px 0; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { background: #24313e; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; transition: background .15s; }
+  button:hover:not(:disabled) { background: #2c3d4d; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #04141f; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #57b0ff; }
+  button.ghost { background: transparent; }
+  button.danger { border-color: var(--danger); color: var(--danger); background: transparent; }
+  button.active { outline: 2px solid var(--accent); }
+  label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+  .val { font-size: 12px; color: var(--text); font-weight: 600; }
+  .hint { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+  .status { font-size: 12.5px; padding: 8px 10px; border-radius: 8px; background: #10202b; border: 1px solid var(--border); color: var(--accent); min-height: 18px; }
+  .progress-wrap { height: 8px; background: #0d1720; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+  .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .15s; }
+  table.metrics { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.metrics th, table.metrics td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); }
+  table.metrics th { color: var(--muted); font-weight: 600; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; margin-bottom: 6px; }
+  .toggle-row input { transform: scale(1.1); }
+  select { background: #24313e; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; font-size: 12px; width: 100%; }
+  .footer-note { font-size: 10.5px; color: #5c7286; text-align: center; margin-top: 4px; }
+  #geocodeRow { display:flex; gap:6px; }
+  #geocodeRow input { flex:1; background:#0d1720; border:1px solid var(--border); color: var(--text); border-radius:6px; padding:6px 8px; font-size:12px; }
+
+  /* ---- Toy sweeper marker (animation playback) ---- */
+  .sweeper-toy { width: 44px; height: 54px; position: relative; }
+  .sweeper-toy .heading {
+    position: absolute; left: 50%; top: 50%; width: 44px; height: 54px;
+    margin: -27px 0 0 -22px; transition: transform .09s linear;
+  }
+  .sweeper-toy .shadow {
+    position: absolute; left: 50%; bottom: 2px; width: 24px; height: 10px;
+    margin-left: -12px; border-radius: 50%;
+    background: rgba(0,0,0,.4); filter: blur(2px);
+    animation: sweeper-pulse 0.6s ease-in-out infinite;
+  }
+  .sweeper-toy .body {
+    position: absolute; left: 9px; top: 7px; width: 26px; height: 40px;
+    border-radius: 5px;
+    background: var(--sweeper-color, #e5322d);
+    border: 2px solid #1c2b3d;
+    box-shadow: 0 2px 6px rgba(0,0,0,.5);
+  }
+  .sweeper-toy .wheel {
+    position: absolute; width: 9px; height: 16px; border-radius: 2px;
+    background: #14181d; border: 1.5px solid #1c2b3d;
+  }
+  .sweeper-toy .wheel.tl { left: 4.5px; top: 9px; }
+  .sweeper-toy .wheel.tr { left: 30.5px; top: 9px; }
+  .sweeper-toy .wheel.bl { left: 4.5px; top: 29px; }
+  .sweeper-toy .wheel.br { left: 30.5px; top: 29px; }
+  .sweeper-toy .light {
+    position: absolute; top: -3px; width: 14px; height: 14px; border-radius: 50%;
+    background: #ffd23f; border: 2px solid #1c2b3d;
+  }
+  .sweeper-toy .light.l { left: 6px; }
+  .sweeper-toy .light.r { left: 24px; }
+  @keyframes sweeper-pulse { 0%, 100% { opacity: .3; transform: scale(1); } 50% { opacity: .5; transform: scale(1.15); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <div>
+      <h1>🧹 Sweeper Coverage Planner</h1>
+      <div class="sub">Draw the area to sweep. Streets are solved exactly (Route Inspection / Chinese Postman); splitting the work across a fleet is solved with multi-agent RL.</div>
+    </div>
+
+    <div class="card">
+      <h2>1 · Find a location</h2>
+      <div id="geocodeRow">
+        <input id="geoInput" placeholder="Search a place or address…" />
+        <button id="geoBtn">Go</button>
+      </div>
+      <div class="hint" style="margin-top:6px;">Or just pan/zoom the map manually.</div>
+    </div>
+
+    <div class="card">
+      <h2>2 · Draw the sweep area</h2>
+      <div class="row">
+        <button id="btnDrawArea">✏️ Draw area</button>
+        <button id="btnFinishArea" disabled>✔ Finish area</button>
+        <button id="btnUndoArea" disabled>⌫ Undo point</button>
+      </div>
+      <div class="hint" style="margin-top:8px;">Click points on the map to trace the boundary of the region to sweep, then hit Finish (min. 3 points). Streets inside it are fetched automatically.</div>
+      <div class="status" id="areaStatus" style="margin-top:8px;">No area drawn yet.</div>
+      <div class="row" style="margin-top:10px;">
+        <button id="btnSetStart" disabled>📍 Set start point</button>
+        <button id="btnClearStart" disabled>✕ Clear start</button>
+      </div>
+      <div class="hint" id="startHint" style="margin-top:6px;">Optional — click a point on the map for where the sweeper begins/ends its route. Leave unset and the solver picks one for you.</div>
+      <div class="row" style="margin-top:10px;">
+        <button id="btnDrawObstacle" disabled>🚧 Mark obstacle</button>
+        <button id="btnFinishObstacle" disabled>✔ Finish obstacle</button>
+        <button id="btnUndoObstacle" disabled>⌫ Undo point</button>
+      </div>
+      <div class="hint" id="obstacleHint" style="margin-top:6px;">Optional — trace any no-go zones inside the area (construction, closed lot). Streets and open-area coverage route around them.</div>
+      <div class="status" id="obstacleStatus" style="margin-top:6px; display:none;"></div>
+      <div class="row" style="margin-top:6px;">
+        <button id="btnClearObstacles" class="ghost" disabled>✕ Clear all obstacles</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>3 · Sweep settings</h2>
+      <div class="hint" style="margin-bottom:8px;">Streets are fetched automatically and solved exactly with Route Inspection (Chinese Postman) — no manual tracing.</div>
+      <div class="toggle-row" style="margin-bottom:0;">
+        <span>🧹 Sweep both curbs (each street twice)</span>
+        <input type="checkbox" id="bothCurbsToggle" checked />
+      </div>
+      <div class="hint" id="bothCurbsHint" style="margin-top:4px;">Real curb-to-curb sweeping needs a pass in each direction, so every street is driven twice. Uncheck to see the single-pass (one curb only) route for comparison.</div>
+      <div class="status" id="roadStatus" style="margin-top:8px; display:none;"></div>
+    </div>
+
+    <div class="card">
+      <h2>4 · Fleet size</h2>
+      <label>Number of sweeper machines: <span class="val" id="numSweepersVal">1</span></label>
+      <input type="range" id="numSweepersSlider" min="1" max="6" step="1" value="1" />
+      <div class="hint" style="margin-top:6px;">More than 1: a multi-agent RL policy decides which streets each sweeper covers (not a fixed split), minimizing the longest single shift.</div>
+    </div>
+
+    <div class="card">
+      <button class="primary" id="btnPlan" disabled style="width:100%; padding:12px; font-size:14px;">⚡ Plan the most efficient sweep</button>
+      <div class="progress-wrap" style="margin-top:10px;"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="status" id="planStatus" style="margin-top:8px;">Draw an area to begin.</div>
+      <div class="row" style="margin-top:8px;">
+        <button class="danger" id="btnReset">↺ Reset everything</button>
+      </div>
+    </div>
+
+    <div class="card" id="resultsCard" style="display:none;">
+      <h2>Results</h2>
+      <table class="metrics" id="metricsTable"></table>
+      <div style="margin-top:10px;">
+        <div class="toggle-row"><span><span class="swatch" style="background:var(--base-color);"></span><span id="baseLabel">Baseline</span></span><input type="checkbox" id="toggleBase" checked/></div>
+        <div id="fleetLegend"></div>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <select id="animSelect" style="flex:1;"></select>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <button id="btnPlay">▶ Simulate sweep</button>
+        <button id="btnPause" disabled>⏸ Pause</button>
+        <button id="btnStopAnim" disabled>⏹ Stop</button>
+      </div>
+      <label style="margin-top:8px;">Playback speed: <span class="val" id="speedVal">2×</span></label>
+      <input type="range" id="speedSlider" min="1" max="20" step="1" value="2" />
+      <div class="step-badge" id="animBadge" style="margin-top:8px; display:inline-block; background:#0d1720; border:1px solid var(--border); border-radius:999px; padding:2px 8px; font-size:11px; color:var(--muted);">0 / 0 m</div>
+
+      <div class="row" style="margin-top:12px;">
+        <button id="btnMidRouteObstacle" style="display:none;">🚧 Obstacle mid-route (RL rebalances)</button>
+      </div>
+      <div id="midRoutePanel" style="display:none; margin-top:8px;">
+        <div class="hint" style="margin-bottom:6px;">Same RL fleet-balancing policy as the initial plan, re-run on the updated street graph — not a second AI system.</div>
+        <label>Which truck hit it? <select id="midRouteVehicle" style="margin-top:4px;"></select></label>
+        <label style="margin-top:8px;">How far along its route: <span class="val" id="midRouteProgressVal">50%</span></label>
+        <input type="range" id="midRouteProgress" min="0" max="100" step="5" value="50" />
+        <div class="hint" id="midRouteHint" style="margin-top:6px;">Click "Draw obstacle", trace it on the map (≥ 3 points), then Finish.</div>
+        <div class="row" style="margin-top:8px;">
+          <button id="btnDrawLiveObstacle">✏️ Draw obstacle</button>
+          <button id="btnFinishLiveObstacle" disabled>✔ Finish &amp; rebalance</button>
+          <button id="btnCancelLiveObstacle" class="ghost">✕ Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-note">Capstone demo · Route Inspection (streets) + multi-agent RL (fleet balancing) — planning runs server-side in Python (Flask)</div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
