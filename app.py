@@ -340,39 +340,5 @@ def plan():
     return plan_street(ways, area, start, k, both_curbs, obstacles)
 
 
-@app.route("/api/replan_obstacle", methods=["POST"])
-def replan_obstacle():
-    """Fleet mode only: a new obstacle appears mid-sweep. This is not a
-    second AI system — it's the exact same multi-agent RL fleet-balancing
-    policy (fleet_rl.train_fleet_assignment) invoked again on the updated
-    street graph (existing obstacles + the new one), so the whole fleet's
-    assignment gets reconsidered together rather than only patching the
-    one affected truck. Each vehicle resumes its new route from its own
-    current position instead of restarting from the original depot."""
-    data = request.get_json(force=True)
-    area = data["area"]
-    ways = data.get("roadWays") or []
-    obstacles = list(data.get("obstacles") or [])
-    new_obstacle = data.get("newObstacle")
-    if new_obstacle:
-        obstacles.append(new_obstacle)
-    both_curbs = both_curbs_flag(data)
-    k = num_sweepers(data)
-
-    raw_positions = data.get("vehiclePositions") or []
-    starts = [tuple(p) if p else None for p in raw_positions]
-    if len(starts) < k:
-        starts += [None] * (k - len(starts))
-
-    G = ri.build_road_graph(ways, area, obstacles)
-    G.remove_nodes_from(list(nx.isolates(G)))
-    if G.number_of_edges() == 0:
-        return jsonify({"error": "No streets left to sweep after removing the obstacle."}), 400
-
-    assignment = fleet_rl.train_fleet_assignment(G, k)
-    vehicles = fleet_rl.build_vehicle_routes(G, assignment, starts, both_curbs=both_curbs)
-    return jsonify(build_fleet_response(vehicles, assignment))
-
-
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

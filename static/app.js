@@ -25,7 +25,7 @@
   }
 
   // ---------------- State ----------------
-  let mode = "idle"; // idle | drawing-area | picking-start | drawing-obstacle | drawing-live-obstacle
+  let mode = "idle"; // idle | drawing-area | picking-start | drawing-obstacle
   let areaPoints = [];
   let areaLayer = null;
   let areaVertexLayers = [];
@@ -40,9 +40,6 @@
   let obstacleVertexLayers = [];
   let obstaclePreviewLine = null;
 
-  let liveObstaclePoints = [];        // mid-route obstacle currently being traced
-  let liveObstacleVertexLayers = [];
-  let liveObstaclePreviewLine = null;
   let lastLabels = { baseline: "Baseline", improved: "Improved path" };
 
   let previewLine = null;
@@ -75,16 +72,6 @@
   const btnClearObstacles = $("btnClearObstacles");
   const obstacleHint = $("obstacleHint");
   const obstacleStatus = $("obstacleStatus");
-
-  const btnMidRouteObstacle = $("btnMidRouteObstacle");
-  const midRoutePanel = $("midRoutePanel");
-  const midRouteVehicle = $("midRouteVehicle");
-  const midRouteProgressVal = $("midRouteProgressVal");
-  const midRouteProgress = $("midRouteProgress");
-  const midRouteHint = $("midRouteHint");
-  const btnDrawLiveObstacle = $("btnDrawLiveObstacle");
-  const btnFinishLiveObstacle = $("btnFinishLiveObstacle");
-  const btnCancelLiveObstacle = $("btnCancelLiveObstacle");
 
   const roadStatus = $("roadStatus");
   const bothCurbsToggle = $("bothCurbsToggle");
@@ -257,13 +244,6 @@
       redrawObstaclePreview();
       btnFinishObstacle.disabled = currentObstaclePoints.length < 3;
       btnUndoObstacle.disabled = false;
-    } else if (mode === "drawing-live-obstacle") {
-      liveObstaclePoints.push(ll);
-      const v = L.circleMarker(ll, { radius: 4, color: "#ffb300", fillColor: "#ffb300", fillOpacity: 1 }).addTo(map);
-      liveObstacleVertexLayers.push(v);
-      redrawLiveObstaclePreview();
-      btnFinishLiveObstacle.disabled = liveObstaclePoints.length < 3;
-      midRouteHint.textContent = liveObstaclePoints.length + " point(s) placed (need ≥ 3), then Finish & rebalance.";
     }
   });
 
@@ -417,129 +397,6 @@
     baselineResult = null;
     rlResult = null;
     fleetResult = null;
-    btnMidRouteObstacle.style.display = "none";
-    midRoutePanel.style.display = "none";
-    resetLiveObstacleDrawing();
-  }
-
-  // ---------------- Mid-route obstacle (fleet mode: re-run the same RL
-  // fleet-balancing policy on the updated street graph, each vehicle
-  // resuming from its own current position) ----------------
-  function redrawLiveObstaclePreview() {
-    if (liveObstaclePreviewLine) { map.removeLayer(liveObstaclePreviewLine); liveObstaclePreviewLine = null; }
-    if (liveObstaclePoints.length < 2) return;
-    liveObstaclePreviewLine = L.polygon(liveObstaclePoints, { color: "#ffb300", weight: 2, fillOpacity: 0.08, dashArray: "4,4" }).addTo(map);
-  }
-
-  function resetLiveObstacleDrawing() {
-    liveObstaclePoints = [];
-    clearLayerList(liveObstacleVertexLayers);
-    if (liveObstaclePreviewLine) { map.removeLayer(liveObstaclePreviewLine); liveObstaclePreviewLine = null; }
-    if (btnDrawLiveObstacle) btnDrawLiveObstacle.classList.remove("active");
-    if (btnFinishLiveObstacle) btnFinishLiveObstacle.disabled = true;
-    if (mode === "drawing-live-obstacle") mode = "idle";
-    if (midRouteHint) midRouteHint.textContent = "Click \"Draw obstacle\", trace it on the map (≥ 3 points), then Finish.";
-  }
-
-  if (btnMidRouteObstacle) {
-    btnMidRouteObstacle.addEventListener("click", () => {
-      if (!fleetResult || fleetResult.numVehicles <= 1) return;
-      const isOpen = midRoutePanel.style.display !== "none";
-      resetLiveObstacleDrawing();
-      if (isOpen) {
-        midRoutePanel.style.display = "none";
-        return;
-      }
-      midRouteVehicle.innerHTML = fleetResult.vehicles
-        .map((v, i) => `<option value="${i}">Sweeper ${v.id}</option>`)
-        .join("");
-      midRoutePanel.style.display = "block";
-    });
-  }
-
-  if (midRouteProgress) {
-    midRouteProgress.addEventListener("input", () => {
-      midRouteProgressVal.textContent = midRouteProgress.value + "%";
-    });
-  }
-
-  if (btnDrawLiveObstacle) {
-    btnDrawLiveObstacle.addEventListener("click", () => {
-      mode = "drawing-live-obstacle";
-      liveObstaclePoints = [];
-      clearLayerList(liveObstacleVertexLayers);
-      if (liveObstaclePreviewLine) { map.removeLayer(liveObstaclePreviewLine); liveObstaclePreviewLine = null; }
-      btnDrawLiveObstacle.classList.add("active");
-      btnFinishLiveObstacle.disabled = true;
-      midRouteHint.textContent = "Click points on the map to trace the obstacle (need ≥ 3), then Finish & rebalance.";
-    });
-  }
-
-  if (btnCancelLiveObstacle) {
-    btnCancelLiveObstacle.addEventListener("click", () => {
-      resetLiveObstacleDrawing();
-      midRoutePanel.style.display = "none";
-    });
-  }
-
-  if (btnFinishLiveObstacle) {
-    btnFinishLiveObstacle.addEventListener("click", async () => {
-      if (liveObstaclePoints.length < 3 || !fleetResult) return;
-      const vIdx = parseInt(midRouteVehicle.value, 10);
-      const v = fleetResult.vehicles[vIdx];
-      if (!v || !v.path || v.path.length < 2) return;
-
-      const progressPct = parseInt(midRouteProgress.value, 10) / 100;
-      const cumDist = computeCumulativeDistances(v.path);
-      const total = cumDist[cumDist.length - 1];
-      const curPos = pointAtDistance(v.path, cumDist, total * progressPct, { i: 0 });
-
-      const k = fleetResult.numVehicles;
-      const vehiclePositions = new Array(k).fill(null);
-      vehiclePositions[vIdx] = curPos;
-
-      btnFinishLiveObstacle.disabled = true;
-      btnDrawLiveObstacle.disabled = true;
-      midRouteHint.textContent = "Rebalancing the fleet with the same RL policy…";
-
-      const payload = {
-        area: areaPoints,
-        roadWays: roadWays || [],
-        obstacles: obstacles,
-        newObstacle: liveObstaclePoints.slice(),
-        bothCurbs: bothCurbsToggle.checked,
-        numSweepers: k,
-        vehiclePositions: vehiclePositions,
-      };
-
-      try {
-        const newFleet = await api("/api/replan_obstacle", payload);
-
-        obstacles.push(liveObstaclePoints.slice());
-        const layer = L.polygon(liveObstaclePoints, { color: "#ffb300", weight: 2, fillOpacity: 0.25, fillColor: "#ffb300" }).addTo(map);
-        obstacleLayers.push(layer);
-        updateObstacleStatus();
-
-        fleetResult = newFleet;
-        clearFleetLayers();
-        for (const veh of fleetResult.vehicles) {
-          fleetLineLayers.push(L.polyline(veh.path, { color: veh.color, weight: 3, opacity: 0.9, dashArray: "1,6" }).addTo(map));
-        }
-        renderFleetLegend(lastLabels);
-        renderAnimOptions(lastLabels);
-        renderFleetMetricsRows();
-        applyToggles();
-        stopAnim();
-
-        resetLiveObstacleDrawing();
-        midRoutePanel.style.display = "none";
-        planStatus.textContent = `Obstacle added mid-route — RL rebalanced the fleet. New makespan ${Math.round(fleetResult.makespanM)} m.`;
-      } catch (e) {
-        midRouteHint.textContent = "Rebalance failed: " + e.message;
-      } finally {
-        btnDrawLiveObstacle.disabled = false;
-      }
-    });
   }
 
   function clearFleetLayers() {
@@ -635,14 +492,6 @@
 
     metricsTable.innerHTML += `<tbody id="fleetRowsBody">${fleetRowsHtml()}</tbody>`;
     animBadge.textContent = "0 / 0 m";
-
-    if (btnMidRouteObstacle) {
-      btnMidRouteObstacle.style.display = fleetResult.numVehicles > 1 ? "inline-block" : "none";
-      if (fleetResult.numVehicles <= 1) {
-        midRoutePanel.style.display = "none";
-        resetLiveObstacleDrawing();
-      }
-    }
   }
 
   // HTML for the fleet-specific metrics rows (split, makespan, train time).

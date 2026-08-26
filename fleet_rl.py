@@ -66,19 +66,31 @@ DEFAULT_EPISODES = 8
 DEFAULT_HIDDEN = 30
 MAX_VEHICLES = 6
 TRANSFERS_PER_VEHICLE = 20  # transfer-step budget scales with k: more vehicles, more boundary to rebalance
+DEFAULT_RESTARTS = 5  # independent seed-partition + RL-training attempts; the best (lowest makespan) wins
 
 
-def _pick_start_nodes(G: nx.MultiGraph, k: int) -> List[NodeKey]:
+def _pick_start_nodes(G: nx.MultiGraph, k: int, first_node: NodeKey = None) -> List[NodeKey]:
     """k geographically spread starting nodes via farthest-point sampling —
     the seeds for the Voronoi partition below. Spread-out seeds are what
-    make the resulting territories roughly equal-sized and non-interleaved."""
+    make the resulting territories roughly equal-sized and non-interleaved.
+
+    `first_node` picks which node farthest-point sampling grows from (it
+    defaults to the graph's first node, which is deterministic but
+    arbitrary — just whatever order the graph happened to build nodes in).
+    Different starting nodes generally produce differently-shaped initial
+    territories, since every other seed is chosen relative to the ones
+    before it. train_fleet_assignment uses this to try a handful of
+    different starting shapes and keep whichever balances best, since a
+    single farthest-point-sampling run has no way to know in advance which
+    starting node will lead to the most even split of a lumpy, non-uniform
+    street network."""
     nodes = list(G.nodes)
     if not nodes:
         return []
     if k >= len(nodes):
         return [nodes[i % len(nodes)] for i in range(k)]
     coords = {n: G.nodes[n]["latlng"] for n in nodes}
-    chosen = [nodes[0]]
+    chosen = [first_node if first_node is not None else nodes[0]]
     for _ in range(k - 1):
         best_n, best_d = None, -1.0
         for n in nodes:
@@ -292,24 +304,22 @@ class FleetAssignment:
     history: list = field(default_factory=list)
 
 
-def train_fleet_assignment(
+def _train_one_restart(
     G: nx.MultiGraph,
     k: int,
-    episodes: int = DEFAULT_EPISODES,
-    hidden_dim: int = DEFAULT_HIDDEN,
-    seed: int = 42,
-    max_transfers: int = 0,
-) -> FleetAssignment:
-    """Voronoi-seed the partition, then train the multi-agent Q-ELM
-    rebalancing policy over many simulated refinement episodes (each
-    starting fresh from the same seed partition), and run one final
-    greedy (epsilon=0) rollout for the assignment actually returned."""
-    t0 = _time.time()
-    k = max(1, min(k, MAX_VEHICLES))
-    if max_transfers <= 0:
-        max_transfers = TRANSFERS_PER_VEHICLE * k
+    start_nodes: List[NodeKey],
+    episodes: int,
+    hidden_dim: int,
+    seed: int,
+    max_transfers: int,
+):
+    """One full seed-partition + Q-ELM training run from a given set of
+    starting nodes, ending in a greedy (epsilon=0) rollout. Pulled out of
+    train_fleet_assignment so it can be repeated from several different
+    starting territories (see DEFAULT_RESTARTS) and the best of them kept —
+    a single farthest-point-sampling seed has no way to know in advance
+    which starting shape will end up easiest to balance evenly."""
     rng = np.random.default_rng(seed)
-    start_nodes = _pick_start_nodes(G, k)
     initial_assigned, weight_of = _voronoi_partition(G, start_nodes, k)
 
     elm = ELM(FEATURE_DIM, hidden_dim, 1, seed=seed)
@@ -338,15 +348,123 @@ def train_fleet_assignment(
     assigned, dist_by_vehicle, makespan, _ = _run_refinement_episode(
         k, initial_assigned, weight_of, start_nodes, elm, 0.0, rng, max_transfers
     )
+    return assigned, dist_by_vehicle, makespan, history
+
+
+def _routed_makespan(G: nx.MultiGraph, edges_by_vehicle: List[List[EdgeKey]]) -> Tuple[float, List[float]]:
+    """The real per-vehicle route length once each vehicle's assigned edges
+    are handed to the exact Route Inspection solver — this is what
+    actually gets driven, and can diverge noticeably from the raw
+    sum-of-edge-weights makespan tracked during RL training. Stitching a
+    vehicle's territory into a single circuit (route_inspection.solve_
+    circuit, via bridge_components()/_eulerize_min()) adds extra distance
+    that depends on that territory's own shape — how many odd-degree nodes
+    it has, whether it's split into disconnected pieces — not just its raw
+    street length. A vehicle that "looks" fairly loaded during training can
+    still end up with a noticeably longer real route than the rest of the
+    fleet purely from this stitching overhead. Restart selection scores
+    candidates on this real, solved makespan rather than the training-time
+    proxy, so it actually optimizes the number the user sees on screen."""
+    lengths: List[float] = []
+    for edges in edges_by_vehicle:
+        if not edges:
+            lengths.append(0.0)
+            continue
+        sub = nx.MultiGraph()
+        for (u, v, key) in edges:
+            data = G.get_edge_data(u, v, key)
+            sub.add_node(u, **G.nodes[u])
+            sub.add_node(v, **G.nodes[v])
+            sub.add_edge(u, v, key=key, **data)
+        result = solve_circuit(sub)
+        lengths.append(result["optimal"]["length_m"] if result else 0.0)
+    return (max(lengths) if lengths else 0.0), lengths
+
+
+def train_fleet_assignment(
+    G: nx.MultiGraph,
+    k: int,
+    episodes: int = DEFAULT_EPISODES,
+    hidden_dim: int = DEFAULT_HIDDEN,
+    seed: int = 42,
+    max_transfers: int = 0,
+    num_restarts: int = DEFAULT_RESTARTS,
+) -> FleetAssignment:
+    """Voronoi-seed the partition, then train the multi-agent Q-ELM
+    rebalancing policy over many simulated refinement episodes, and run one
+    final greedy (epsilon=0) rollout for the assignment actually returned.
+
+    Because real street networks are lumpy rather than uniform, the shape
+    of the *initial* Voronoi partition — which depends entirely on which
+    node farthest-point sampling happens to start from — can make a real
+    difference to how evenly the RL step is able to balance things
+    afterwards (rebalancing can only move edges between vehicles that
+    already share a boundary, so a bad starting shape can leave one
+    vehicle boxed in with no good neighbour to hand load to). Rather than
+    committing to one starting shape, this runs num_restarts independent
+    attempts — the first from the graph's default starting node (so
+    behaviour is unchanged if num_restarts=1), the rest from a handful of
+    different randomly-chosen starting nodes — and keeps whichever attempt
+    produced the lowest makespan. This costs roughly num_restarts times the
+    compute of a single attempt, which is still fast (each attempt is a
+    handful of ELM-scored episodes over a small feature vector), in
+    exchange for meaningfully more consistent load balancing."""
+    t0 = _time.time()
+    k = max(1, min(k, MAX_VEHICLES))
+    if max_transfers <= 0:
+        max_transfers = TRANSFERS_PER_VEHICLE * k
+    num_restarts = max(1, num_restarts)
+
+    # A single restart's cost scales with the size of the street graph (each
+    # transfer step scans the busiest vehicle's edges), so blindly repeating
+    # it DEFAULT_RESTARTS times on a very large fetched area could make one
+    # planning request take unreasonably long. Only scale restarts down when
+    # the caller left it at the default — an explicit num_restarts always
+    # wins.
+    if num_restarts == DEFAULT_RESTARTS:
+        num_edges = G.number_of_edges()
+        if num_edges > 900:
+            num_restarts = 2
+        elif num_edges > 500:
+            num_restarts = 3
+
+    nodes = list(G.nodes)
+    picker_rng = np.random.default_rng(seed)
+
+    best_assigned = None
+    best_dist = None
+    best_routed_makespan = float("inf")
+    restart_history = []
+
+    for r in range(num_restarts):
+        if r == 0 or len(nodes) <= k:
+            start_nodes = _pick_start_nodes(G, k)
+        else:
+            first_node = nodes[int(picker_rng.integers(len(nodes)))]
+            start_nodes = _pick_start_nodes(G, k, first_node=first_node)
+
+        restart_seed = seed + r * 7919  # distinct, deterministic per restart
+        assigned, dist_by_vehicle, train_makespan, history = _train_one_restart(
+            G, k, start_nodes, episodes, hidden_dim, restart_seed, max_transfers
+        )
+        routed_makespan, _routed_lengths = _routed_makespan(G, assigned)
+        restart_history.append({
+            "restart": r,
+            "train_makespan_m": train_makespan,
+            "routed_makespan_m": routed_makespan,
+        })
+        if routed_makespan < best_routed_makespan:
+            best_assigned, best_dist, best_routed_makespan = assigned, dist_by_vehicle, routed_makespan
+
     train_ms = (_time.time() - t0) * 1000.0
 
     return FleetAssignment(
-        edges_by_vehicle=assigned,
-        dist_by_vehicle=dist_by_vehicle,
-        makespan_m=makespan,
+        edges_by_vehicle=best_assigned,
+        dist_by_vehicle=best_dist,
+        makespan_m=best_routed_makespan,
         episodes_run=episodes,
         train_ms=train_ms,
-        history=history,
+        history=restart_history,
     )
 
 
@@ -356,12 +474,9 @@ def build_vehicle_routes(
     """Hand each vehicle's RL-assigned edges back to the exact Route
     Inspection solver for that vehicle's own optimal circuit.
 
-    start_latlng is either a single (lat, lng) applied to every vehicle
-    (the normal case — each vehicle starts wherever is nearest in its own
-    territory), or a list with one entry per vehicle (None allowed for
-    "no preference"), used when replanning after a mid-route obstacle so
-    each vehicle resumes from its own current position instead of a
-    shared point.
+    start_latlng is a single (lat, lng) applied to every vehicle (the
+    normal case — each vehicle starts wherever is nearest in its own
+    territory), or None to let the solver pick.
 
     both_curbs=True routes each vehicle over its own assigned streets
     twice (once per direction/curb) instead of once. Note this doesn't
@@ -371,12 +486,9 @@ def build_vehicle_routes(
     by the same factor (here, driving it twice instead of once) doesn't
     change which split is balanced — so a single fleet_rl run already
     produces the right assignment for either mode."""
-    n = len(assignment.edges_by_vehicle)
-    per_vehicle_start = start_latlng if isinstance(start_latlng, list) else [start_latlng] * n
-
     vehicles = []
     for i, edges in enumerate(assignment.edges_by_vehicle):
-        this_start = per_vehicle_start[i] if i < len(per_vehicle_start) else None
+        this_start = start_latlng
         if not edges:
             vehicles.append({"path": [], "lengthM": 0.0, "steps": 0})
             continue

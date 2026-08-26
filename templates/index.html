@@ -170,22 +170,6 @@
       <label style="margin-top:8px;">Playback speed: <span class="val" id="speedVal">2×</span></label>
       <input type="range" id="speedSlider" min="1" max="20" step="1" value="2" />
       <div class="step-badge" id="animBadge" style="margin-top:8px; display:inline-block; background:#0d1720; border:1px solid var(--border); border-radius:999px; padding:2px 8px; font-size:11px; color:var(--muted);">0 / 0 m</div>
-
-      <div class="row" style="margin-top:12px;">
-        <button id="btnMidRouteObstacle" style="display:none;">🚧 Obstacle mid-route (RL rebalances)</button>
-      </div>
-      <div id="midRoutePanel" style="display:none; margin-top:8px;">
-        <div class="hint" style="margin-bottom:6px;">Same RL fleet-balancing policy as the initial plan, re-run on the updated street graph — not a second AI system.</div>
-        <label>Which truck hit it? <select id="midRouteVehicle" style="margin-top:4px;"></select></label>
-        <label style="margin-top:8px;">How far along its route: <span class="val" id="midRouteProgressVal">50%</span></label>
-        <input type="range" id="midRouteProgress" min="0" max="100" step="5" value="50" />
-        <div class="hint" id="midRouteHint" style="margin-top:6px;">Click "Draw obstacle", trace it on the map (≥ 3 points), then Finish.</div>
-        <div class="row" style="margin-top:8px;">
-          <button id="btnDrawLiveObstacle">✏️ Draw obstacle</button>
-          <button id="btnFinishLiveObstacle" disabled>✔ Finish &amp; rebalance</button>
-          <button id="btnCancelLiveObstacle" class="ghost">✕ Cancel</button>
-        </div>
-      </div>
     </div>
 
     <div class="footer-note">Capstone demo · Route Inspection (streets) + multi-agent RL (fleet balancing) — planning runs server-side in Python (Flask)</div>
