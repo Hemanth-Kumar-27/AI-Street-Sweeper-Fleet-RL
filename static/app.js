@@ -51,8 +51,11 @@
   let baselineResult = null;
   let rlResult = null;
   let fleetResult = null;   // { numVehicles, vehicles:[{id,color,path,lengthM,steps}], makespanM, totalLengthM, trainMs, episodesRun }
+  let randomFleetResult = null; // same shape as fleetResult, but from a fully random street-to-truck assignment (comparison baseline)
+  let lastBatchSummary = null;   // { numTrials, fleetSize, qelmMakespanM, avgRandomMakespanM, avgSavedPct, minSavedPct, maxSavedPct }
   let baseLineLayer = null;
   let fleetLineLayers = []; // one polyline per vehicle, parallel to fleetResult.vehicles
+  let randomFleetLineLayers = []; // ghost-overlay polylines, parallel to randomFleetResult.vehicles
 
   let animTimer = null;
   let animEntries = [];     // one entry per simultaneously-animating vehicle/path: {pathLatLngs, cumDist, totalDist, dist, seg, marker}
@@ -87,6 +90,21 @@
   const resultsCard = $("resultsCard");
   const metricsTable = $("metricsTable");
   const toggleBase = $("toggleBase");
+  const toggleRandomRow = $("toggleRandomRow");
+  const toggleRandomFleet = $("toggleRandomFleet");
+  const fleetCompareBlock = $("fleetCompareBlock");
+  const batchCompareRow = $("batchCompareRow");
+  const btnBatchCompare = $("btnBatchCompare");
+  const batchCompareStatus = $("batchCompareStatus");
+  const batchChartWrap = $("batchChartWrap");
+  const batchChartImg = $("batchChartImg");
+  const batchChartLink = $("batchChartLink");
+  const savingsBlock = $("savingsBlock");
+  const costPerKmSlider = $("costPerKmSlider");
+  const costPerKmVal = $("costPerKmVal");
+  const sweepsPerMonthSlider = $("sweepsPerMonthSlider");
+  const sweepsPerMonthVal = $("sweepsPerMonthVal");
+  const savingsSummary = $("savingsSummary");
   const animSelect = $("animSelect");
   const btnPlay = $("btnPlay");
   const btnPause = $("btnPause");
@@ -392,16 +410,32 @@
   function resetPlanResultsOnly() {
     if (baseLineLayer) { map.removeLayer(baseLineLayer); baseLineLayer = null; }
     clearFleetLayers();
+    clearRandomFleetLayers();
     stopAnim();
     resultsCard.style.display = "none";
     baselineResult = null;
     rlResult = null;
     fleetResult = null;
+    randomFleetResult = null;
+    toggleRandomRow.style.display = "none";
+    fleetCompareBlock.style.display = "none";
+    if (toggleRandomFleet) toggleRandomFleet.checked = false;
+    if (batchCompareRow) batchCompareRow.style.display = "none";
+    if (batchCompareStatus) { batchCompareStatus.style.display = "none"; batchCompareStatus.textContent = ""; }
+    if (batchChartImg) batchChartImg.src = "";
+    if (batchChartWrap) batchChartWrap.style.display = "none";
+    if (savingsBlock) savingsBlock.style.display = "none";
+    lastBatchSummary = null;
   }
 
   function clearFleetLayers() {
     for (const l of fleetLineLayers) map.removeLayer(l);
     fleetLineLayers = [];
+  }
+
+  function clearRandomFleetLayers() {
+    for (const l of randomFleetLineLayers) map.removeLayer(l);
+    randomFleetLineLayers = [];
   }
 
   // ---------------- Planning (server-side) ----------------
@@ -447,6 +481,7 @@
     baselineResult = result.baseline;
     rlResult = result.rl;
     fleetResult = result.fleet || { numVehicles: 1, vehicles: [{ id: 1, color: "#23c98f", path: rlResult.path, lengthM: rlResult.lengthM, steps: rlResult.steps }], makespanM: rlResult.lengthM, totalLengthM: rlResult.lengthM };
+    randomFleetResult = result.fleetRandom || null;
     const fleetDoneNote = fleetResult.numVehicles > 1
       ? ` Split across ${fleetResult.numVehicles} sweepers via multi-agent RL — makespan ${Math.round(fleetResult.makespanM)} m.`
       : "";
@@ -472,6 +507,21 @@
     renderFleetLegend(labels);
     renderAnimOptions(labels);
 
+    clearRandomFleetLayers();
+    if (randomFleetResult && randomFleetResult.numVehicles > 1) {
+      for (const v of randomFleetResult.vehicles) {
+        randomFleetLineLayers.push(L.polyline(v.path, { color: "#8a8f99", weight: 2, opacity: 0.55, dashArray: "2,6" }));
+      }
+      toggleRandomRow.style.display = "flex";
+      if (toggleRandomFleet) toggleRandomFleet.checked = false;
+      renderFleetCompare();
+    } else {
+      toggleRandomRow.style.display = "none";
+      fleetCompareBlock.style.display = "none";
+    }
+    if (batchCompareRow) batchCompareRow.style.display = (fleetResult.numVehicles > 1) ? "flex" : "none";
+    if (batchCompareStatus) { batchCompareStatus.style.display = "none"; batchCompareStatus.textContent = ""; }
+
     map.fitBounds(L.polygon(areaPoints).getBounds(), { padding: [30, 30] });
     applyToggles();
 
@@ -486,7 +536,7 @@
       <tr><td>Streets covered</td><td colspan="2">${streets.numStreets} segments, ${streets.streetLengthM.toFixed(0)} m of real street</td></tr>
       <tr><td>Route length</td><td>${baselineResult.lengthM.toFixed(0)} m</td><td>${rlResult.lengthM.toFixed(0)} m</td></tr>
       <tr><td>Overhead vs. real street length</td><td>${baseOverheadPct.toFixed(0)}%</td><td>${overheadPct.toFixed(0)}%</td></tr>
-      <tr><td>Compute time (Python)</td><td colspan="2">${rlResult.timeMs.toFixed(0)} ms (solved once for both)</td></tr>
+      <tr><td>Compute time (Python)</td><td colspan="2">${formatDuration(rlResult.timeMs)} (solved once for both)</td></tr>
       ${noteRow}
     `;
 
@@ -503,8 +553,21 @@
     return `
       <tr><td>Fleet split (${fleetResult.numVehicles} sweepers, RL task allocation)</td><td colspan="2">${perVehicle}</td></tr>
       <tr><td>Makespan (longest shift)</td><td colspan="2"><b>${Math.round(fleetResult.makespanM)} m</b> — the real bottleneck for how long the job takes with ${fleetResult.numVehicles} machines working in parallel</td></tr>
-      <tr><td>Fleet RL train time</td><td colspan="2">${Math.round(fleetResult.trainMs)} ms</td></tr>
+      <tr><td>Fleet RL train time</td><td colspan="2">${formatDuration(fleetResult.trainMs)}</td></tr>
     `;
+  }
+
+  // Milliseconds under a second stay as "N ms" (no point in "0.02s"); a
+  // full minute or more gets broken into minutes + seconds, since fleet
+  // training can run into the tens of seconds and "18700 ms" is harder to
+  // read at a glance than "18.7s".
+  function formatDuration(ms) {
+    if (!isFinite(ms) || ms < 0) return "0 ms";
+    if (ms < 1000) return `${Math.round(ms)} ms`;
+    const totalSeconds = ms / 1000;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds - minutes * 60;
+    return minutes > 0 ? `${minutes}m ${seconds.toFixed(1)}s` : `${seconds.toFixed(1)}s`;
   }
 
   function renderFleetMetricsRows() {
@@ -536,13 +599,38 @@
     if (fleetResult.numVehicles > 1) {
       html += `<option value="all" selected>Animate: all ${fleetResult.numVehicles} sweepers at once</option>`;
       html += fleetResult.vehicles.map((v, i) => `<option value="v${i}">Animate: Sweeper ${v.id} only</option>`).join("");
+      if (randomFleetResult && randomFleetResult.numVehicles > 1) {
+        html += `<option value="randomAll">Animate: Random sweeping — all trucks (no planning)</option>`;
+      }
     } else {
       html += `<option value="v0" selected>Animate: ${labels.improved}</option>`;
     }
     animSelect.innerHTML = html;
   }
 
+  // Live "before vs. after" summary for the demo panel: how much shorter
+  // the busiest truck's route gets once the Q-ELM policy plans the split,
+  // versus every street being thrown to a truck completely at random.
+  function renderFleetCompare() {
+    if (!randomFleetResult || !fleetResult || fleetResult.numVehicles <= 1) {
+      fleetCompareBlock.style.display = "none";
+      return;
+    }
+    const randomM = randomFleetResult.makespanM;
+    const qelmM = fleetResult.makespanM;
+    const savedM = Math.max(0, randomM - qelmM);
+    const savedPct = randomM > 0 ? (savedM / randomM * 100) : 0;
+    fleetCompareBlock.style.display = "block";
+    fleetCompareBlock.innerHTML = `
+      <div style="font-weight:600; margin-bottom:4px; color:var(--text);">Fleet balancing vs. random sweeping</div>
+      <div>Random sweeping (no planning) — longest truck: <b>${Math.round(randomM)} m</b></div>
+      <div>Q-ELM fleet balancing — longest truck: <b>${Math.round(qelmM)} m</b></div>
+      <div style="margin-top:4px; color:var(--accent2);">Distance saved on the busiest truck: <b>${Math.round(savedM)} m (${savedPct.toFixed(0)}%)</b></div>
+    `;
+  }
+
   toggleBase.addEventListener("change", applyToggles);
+  if (toggleRandomFleet) toggleRandomFleet.addEventListener("change", applyToggles);
   function applyToggles() {
     if (baseLineLayer) {
       if (toggleBase.checked) { if (!map.hasLayer(baseLineLayer)) baseLineLayer.addTo(map); } else map.removeLayer(baseLineLayer);
@@ -553,6 +641,10 @@
       if (!layer) return;
       if (cb.checked) { if (!map.hasLayer(layer)) layer.addTo(map); } else map.removeLayer(layer);
     });
+    const showRandom = toggleRandomFleet && toggleRandomFleet.checked;
+    for (const l of randomFleetLineLayers) {
+      if (showRandom) { if (!map.hasLayer(l)) l.addTo(map); } else map.removeLayer(l);
+    }
   }
 
   // ---------------- Animation ----------------
@@ -630,6 +722,7 @@
     const which = animSelect.value;
     if (which === "base") return [{ path: baselineResult.path, color: "#ff9f43" }];
     if (which === "all") return fleetResult.vehicles.map((v) => ({ path: v.path, color: v.color }));
+    if (which === "randomAll" && randomFleetResult) return randomFleetResult.vehicles.map((v) => ({ path: v.path, color: "#8a8f99" }));
     const m = /^v(\d+)$/.exec(which);
     if (m && fleetResult.vehicles[+m[1]]) {
       const v = fleetResult.vehicles[+m[1]];
@@ -713,5 +806,83 @@
     btnPause.disabled = true;
     btnStopAnim.disabled = true;
     animBadge.textContent = "0 / 0 m";
+  }
+
+  // ---------------- Batch comparison: 30 random draws vs. one Q-ELM plan ----------------
+  // A single random-sweeping draw (like the live ghost overlay) is just one
+  // sample — it could get unlucky or lucky. This runs the exact same area
+  // and fleet size through many independent random assignments so the
+  // "distance saved" claim is backed by a distribution, not one data point,
+  // shown as a chart plus a rough cost-savings projection.
+  if (btnBatchCompare) {
+    btnBatchCompare.addEventListener("click", async () => {
+      if (!fleetResult || fleetResult.numVehicles <= 1) return;
+      btnBatchCompare.disabled = true;
+      batchCompareStatus.style.display = "block";
+      batchCompareStatus.textContent = "Running 30 random-sweeping draws on the Python backend…";
+
+      const k = parseInt(numSweepersSlider.value, 10) || 1;
+      const payload = {
+        area: areaPoints, mode: "street", roadWays: roadWays || [], numSweepers: k,
+        bothCurbs: bothCurbsToggle.checked, start: startPoint || null, obstacles: obstacles,
+        numTrials: 30,
+      };
+      try {
+        const res = await api("/api/compare_random_batch", payload);
+        renderBatchChart(res.chartPngBase64);
+        lastBatchSummary = res.summary;
+        savingsBlock.style.display = "block";
+        updateSavingsDisplay();
+        const s = res.summary;
+        batchCompareStatus.textContent =
+          `Done — across ${s.numTrials} random draws (fleet size ${s.fleetSize}), Q-ELM saved ` +
+          `${s.avgSavedPct.toFixed(1)}% on average (range ${s.minSavedPct.toFixed(1)}%–${s.maxSavedPct.toFixed(1)}%). Chart shown below.`;
+        batchChartWrap.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      } catch (e) {
+        batchCompareStatus.textContent = "Batch comparison failed: " + e.message;
+      } finally {
+        btnBatchCompare.disabled = false;
+      }
+    });
+  }
+
+  // Chart is rendered server-side (matplotlib/seaborn) and handed back as a
+  // base64 PNG — no client-side charting library or CDN involved, so it
+  // can't silently fail to load. Wrapped in a link so clicking it opens the
+  // full-size image in its own tab (handy for screen-sharing to a panel).
+  function renderBatchChart(pngDataUri) {
+    if (!batchChartWrap || !pngDataUri) return;
+    batchChartImg.src = pngDataUri;
+    if (batchChartLink) batchChartLink.href = pngDataUri;
+    batchChartWrap.style.display = "block";
+  }
+
+  // ---------------- Cost-savings projection ----------------
+  // Rough, user-adjustable projection: (average distance saved per sweep) x
+  // (assumed cost per km) x (how often this exact route is swept). Defaults
+  // are just a starting assumption — the sliders exist so the numbers can
+  // be corrected live if the panel has better local figures.
+  if (costPerKmSlider) costPerKmSlider.addEventListener("input", updateSavingsDisplay);
+  if (sweepsPerMonthSlider) sweepsPerMonthSlider.addEventListener("input", updateSavingsDisplay);
+
+  function updateSavingsDisplay() {
+    if (!lastBatchSummary || !savingsSummary) return;
+    const costPerKm = parseFloat(costPerKmSlider.value);
+    const sweepsPerMonth = parseInt(sweepsPerMonthSlider.value, 10);
+    costPerKmVal.textContent = costPerKm;
+    sweepsPerMonthVal.textContent = sweepsPerMonth;
+
+    const avgSavedKm = Math.max(0, (lastBatchSummary.avgRandomMakespanM - lastBatchSummary.qelmMakespanM) / 1000);
+    const savingsPerSweep = avgSavedKm * costPerKm;
+    const savingsPerMonth = savingsPerSweep * sweepsPerMonth;
+    const savingsPerYear = savingsPerMonth * 12;
+
+    savingsSummary.innerHTML = `
+      <div>Average distance saved per sweep (busiest truck): <b>${avgSavedKm.toFixed(2)} km</b></div>
+      <div>Estimated saving per sweep: <b>₹${savingsPerSweep.toFixed(0)}</b></div>
+      <div style="margin-top:4px; color:var(--accent2);">Estimated monthly saving: <b>₹${Math.round(savingsPerMonth).toLocaleString("en-IN")}</b></div>
+      <div style="color:var(--accent2);">Estimated yearly saving: <b>₹${Math.round(savingsPerYear).toLocaleString("en-IN")}</b></div>
+      <div class="hint" style="margin-top:6px;">Assumes ₹${costPerKm}/km operating cost and ${sweepsPerMonth} sweeps/month of this exact route on the busiest truck — adjust the sliders for your own numbers.</div>
+    `;
   }
 })();

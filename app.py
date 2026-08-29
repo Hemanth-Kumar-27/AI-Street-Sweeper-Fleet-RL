@@ -33,12 +33,17 @@ then open http://127.0.0.1:5000 in a browser.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+import matplotlib
+matplotlib.use("Agg")  # headless — this process never opens a display
+import matplotlib.pyplot as plt
 import networkx as nx
 from flask import Flask, jsonify, render_template, request
 
@@ -46,6 +51,14 @@ import fleet_rl
 import hybrid_planner as hp
 import osm_offline
 import route_inspection as ri
+
+try:
+    import seaborn as sns
+    sns.set_theme(style="darkgrid")
+except ImportError:
+    # seaborn is optional — matplotlib ships an equivalent built-in style,
+    # so the chart still looks right even if seaborn isn't installed.
+    plt.style.use("seaborn-v0_8-darkgrid")
 
 app = Flask(__name__)
 
@@ -193,7 +206,10 @@ def plan_street(ways, area, start, k=1, both_curbs=True, obstacles=None):
     (misses a curb) vs. both curbs covered (the real requirement)."""
     t0 = time.time()
     G = ri.build_road_graph(ways, area, obstacles)
-    result = ri.solve_circuit(G, start)
+    # "optimal" is always shown (either as baseline or as the improved
+    # route); "naive"/"both_curbs" are mutually exclusive depending on the
+    # toggle below, so only the one actually needed is computed.
+    result = ri.solve_circuit(G, start, need_naive=not both_curbs, need_both_curbs=both_curbs)
     solve_ms = (time.time() - t0) * 1000.0
 
     if result is None:
@@ -239,7 +255,32 @@ def plan_street(ways, area, start, k=1, both_curbs=True, obstacles=None):
         vehicles = fleet_rl.build_vehicle_routes(G, assignment, start, both_curbs=both_curbs)
         response["fleet"] = build_fleet_response(vehicles, assignment)
 
+        # Random-assignment baseline, computed alongside the real plan so
+        # the UI can show a live "random sweeping vs. fleet balancing"
+        # distance-saved comparison — see fleet_rl.random_fleet_assignment.
+        random_assignment = fleet_rl.random_fleet_assignment(G, k)
+        random_vehicles = fleet_rl.build_vehicle_routes(G, random_assignment, start, both_curbs=both_curbs)
+        response["fleetRandom"] = build_fleet_response(random_vehicles, random_assignment)
+
     return jsonify(response)
+
+
+def _fleet_with_pockets(G, assignment, start, both_curbs, pockets):
+    """Shared by the Q-ELM and random-assignment fleets in hybrid mode:
+    solve each vehicle's assigned streets, then stitch on whichever open
+    pockets fall nearest that vehicle's own route."""
+    vehicles = fleet_rl.build_vehicle_routes(G, assignment, start, both_curbs=both_curbs)
+    vehicle_paths = [v["path"] for v in vehicles]
+    pockets_by_vehicle = [[] for _ in vehicles]
+    for p in pockets:
+        pockets_by_vehicle[hp.nearest_vehicle(vehicle_paths, p.path_latlng[0])].append(p)
+    for i, v in enumerate(vehicles):
+        if pockets_by_vehicle[i]:
+            stitched, _ = hp.stitch_route(v["path"], pockets_by_vehicle[i])
+            v["path"] = stitched
+            v["lengthM"] = ri.path_length_m(stitched)
+            v["steps"] = len(stitched) - 1
+    return build_fleet_response(vehicles, assignment)
 
 
 def plan_hybrid(ways, area, start, k=1, both_curbs=True, obstacles=None):
@@ -262,7 +303,9 @@ def plan_hybrid(ways, area, start, k=1, both_curbs=True, obstacles=None):
 
     t0 = time.time()
     G = ri.build_road_graph(ways, area, obstacles)
-    cpp_result = ri.solve_circuit(G, start)
+    # Hybrid mode never looks at "naive"; only one of optimal/both_curbs is
+    # actually used as street_route below, depending on the toggle.
+    cpp_result = ri.solve_circuit(G, start, need_optimal=not both_curbs, need_naive=False, need_both_curbs=both_curbs)
     if cpp_result is None:
         return jsonify({"error": "No usable streets found in this area — try a different location."}), 400
 
@@ -307,18 +350,12 @@ def plan_hybrid(ways, area, start, k=1, both_curbs=True, obstacles=None):
 
     if k > 1:
         assignment = fleet_rl.train_fleet_assignment(G, k)
-        vehicles = fleet_rl.build_vehicle_routes(G, assignment, start, both_curbs=both_curbs)
-        vehicle_paths = [v["path"] for v in vehicles]
-        pockets_by_vehicle = [[] for _ in vehicles]
-        for p in pockets:
-            pockets_by_vehicle[hp.nearest_vehicle(vehicle_paths, p.path_latlng[0])].append(p)
-        for i, v in enumerate(vehicles):
-            if pockets_by_vehicle[i]:
-                stitched, _ = hp.stitch_route(v["path"], pockets_by_vehicle[i])
-                v["path"] = stitched
-                v["lengthM"] = ri.path_length_m(stitched)
-                v["steps"] = len(stitched) - 1
-        response["fleet"] = build_fleet_response(vehicles, assignment)
+        response["fleet"] = _fleet_with_pockets(G, assignment, start, both_curbs, pockets)
+
+        # Random-assignment baseline (see plan_street for why) — pockets are
+        # stitched on the same way so the comparison stays apples-to-apples.
+        random_assignment = fleet_rl.random_fleet_assignment(G, k)
+        response["fleetRandom"] = _fleet_with_pockets(G, random_assignment, start, both_curbs, pockets)
 
     return jsonify(response)
 
@@ -338,6 +375,109 @@ def plan():
     if mode == "hybrid":
         return plan_hybrid(ways, area, start, k, both_curbs, obstacles)
     return plan_street(ways, area, start, k, both_curbs, obstacles)
+
+
+def _render_batch_chart_png(rows: list, summary: dict) -> str:
+    """Bar-per-random-draw chart with a flat reference line for the one
+    Q-ELM plan, rendered server-side with matplotlib/seaborn and returned as
+    a base64 PNG data URI — the frontend just drops this straight into an
+    <img> tag, so there's no client-side charting library or CDN involved."""
+    trials = [r["trial"] for r in rows]
+    random_km = [r["randomMakespanM"] / 1000.0 for r in rows]
+    qelm_km = summary["qelmMakespanM"] / 1000.0
+    avg_random_km = summary["avgRandomMakespanM"] / 1000.0
+    avg_saved_km = max(0.0, avg_random_km - qelm_km)
+    avg_saved_pct = summary["avgSavedPct"]
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.6), dpi=130)
+    ax.bar(trials, random_km, color="#8a8f99", label="Random sweeping (per draw)", zorder=2)
+    ax.axhline(qelm_km, color="#23c98f", linewidth=2.5,
+               label=f"Q-ELM fleet balancing ({qelm_km:.2f} km)", zorder=3)
+    ax.set_xlabel("Random-sweeping trial")
+    ax.set_ylabel("Longest-truck distance (km)")
+    ax.set_title(
+        f"Random sweeping ({summary['numTrials']} draws) vs. Q-ELM — fleet of {summary['fleetSize']}\n"
+        f"Average distance saved: {avg_saved_km:.2f} km ({avg_saved_pct:.1f}%)",
+        fontsize=12,
+    )
+    # Headroom above the tallest bar/line so the legend sits in empty space
+    # instead of covering any bars, regardless of how tall they happen to be.
+    top = max(random_km + [qelm_km]) if random_km else qelm_km
+    ax.set_ylim(0, top * 1.3)
+    ax.legend(loc="upper center", ncol=2, frameon=True, framealpha=0.9, fontsize=9)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    encoded = base64.b64encode(buf.read()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+@app.route("/api/compare_random_batch", methods=["POST"])
+def compare_random_batch():
+    """Run one real Q-ELM fleet plan against many independent random-sweeping
+    draws on the exact same area and fleet size, so the "distance saved"
+    number shown live in the UI can be backed by a whole distribution of
+    random outcomes, not just whichever single random seed happened to be
+    used on screen. Returns per-trial rows, summary stats, and a ready-to-
+    display chart image."""
+    data = request.get_json(force=True)
+    area = data["area"]
+    ways = data.get("roadWays") or []
+    obstacles = data.get("obstacles") or []
+    start_latlng = data.get("start")
+    start = tuple(start_latlng) if start_latlng else None
+    k = num_sweepers(data)
+    both_curbs = both_curbs_flag(data)
+    try:
+        num_trials = max(1, min(int(data.get("numTrials", 30)), 200))
+    except (TypeError, ValueError):
+        num_trials = 30
+
+    if k <= 1:
+        return jsonify({"error": "Pick a fleet size of 2 or more sweepers before running this comparison."}), 400
+
+    G = ri.build_road_graph(ways, area, obstacles)
+    if G.number_of_edges() == 0:
+        return jsonify({"error": "No usable streets found in this area — try a different location."}), 400
+
+    assignment = fleet_rl.train_fleet_assignment(G, k)
+    qelm_vehicles = fleet_rl.build_vehicle_routes(G, assignment, start, both_curbs=both_curbs)
+    qelm_lengths = [v["lengthM"] for v in qelm_vehicles]
+    qelm_makespan = max(qelm_lengths) if qelm_lengths else 0.0
+
+    rows = []
+    for i in range(num_trials):
+        seed = 1000 + i  # distinct, reproducible per trial
+        random_assignment = fleet_rl.random_fleet_assignment(G, k, seed=seed)
+        random_vehicles = fleet_rl.build_vehicle_routes(G, random_assignment, start, both_curbs=both_curbs)
+        random_lengths = [v["lengthM"] for v in random_vehicles]
+        random_makespan = max(random_lengths) if random_lengths else 0.0
+        saved_m = max(0.0, random_makespan - qelm_makespan)
+        saved_pct = (saved_m / random_makespan * 100.0) if random_makespan else 0.0
+        rows.append({
+            "trial": i + 1,
+            "seed": seed,
+            "qelmMakespanM": qelm_makespan,
+            "randomMakespanM": random_makespan,
+            "savedM": saved_m,
+            "savedPct": saved_pct,
+        })
+
+    saved_pcts = [r["savedPct"] for r in rows]
+    summary = {
+        "numTrials": num_trials,
+        "fleetSize": k,
+        "qelmMakespanM": qelm_makespan,
+        "avgRandomMakespanM": sum(r["randomMakespanM"] for r in rows) / len(rows),
+        "avgSavedPct": sum(saved_pcts) / len(saved_pcts),
+        "minSavedPct": min(saved_pcts),
+        "maxSavedPct": max(saved_pcts),
+    }
+    chart_png = _render_batch_chart_png(rows, summary)
+    return jsonify({"rows": rows, "summary": summary, "chartPngBase64": chart_png})
 
 
 if __name__ == "__main__":

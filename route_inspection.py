@@ -248,17 +248,33 @@ def _circuit_path(G: nx.MultiGraph, start_key) -> Tuple[List[LatLng], float]:
     return path, total
 
 
-def solve_circuit(G: nx.MultiGraph, start_latlng: Optional[LatLng] = None) -> Optional[dict]:
+def solve_circuit(
+    G: nx.MultiGraph,
+    start_latlng: Optional[LatLng] = None,
+    need_optimal: bool = True,
+    need_naive: bool = True,
+    need_both_curbs: bool = True,
+) -> Optional[dict]:
     """Given an already-built street multigraph (possibly disconnected,
     possibly just a subset of a larger graph), bridge any disconnected
-    pieces and solve Chinese Postman on it exactly, returning both the
-    optimized and naive (always double every street) circuits.
+    pieces and solve Chinese Postman on it exactly, returning the requested
+    circuit variant(s).
 
     This is the piece shared by the single-vehicle pipeline
     (solve_route_inspection, below) and per-vehicle fleet sub-routes after
     RL-based task allocation (fleet_rl.py) — routing itself is always
     solved exactly and classically; only *which streets a given vehicle
     is responsible for* is ever a learned decision.
+
+    The "optimal" (single-pass) variant is the only one that needs the
+    minimum-weight matching step (_eulerize_min) — by far the most
+    expensive part of this function on larger graphs. Callers that only
+    ever look at "both_curbs" (the app's default sweeping mode) or only at
+    "naive" should pass need_optimal=False so that matching never runs at
+    all; this matters a lot when solve_circuit is called many times in a
+    loop (once per vehicle, once per random-sweeping trial, once per
+    Q-ELM restart). All three default to True so existing callers that
+    want the full comparison keep working unchanged.
 
     Returns None if G has no edges.
     """
@@ -281,22 +297,24 @@ def solve_circuit(G: nx.MultiGraph, start_latlng: Optional[LatLng] = None) -> Op
     original_length = sum(d["weight"] for _, _, d in G.edges(data=True))
     num_streets = G.number_of_edges()
 
-    G_opt = _eulerize_min(G)
-    opt_path, opt_length = _circuit_path(G_opt, start_key)
+    result = {"original_length_m": original_length, "num_streets": num_streets}
 
-    G_naive = _eulerize_naive(G)
-    naive_path, naive_length = _circuit_path(G_naive, start_key)
+    if need_optimal:
+        G_opt = _eulerize_min(G)
+        opt_path, opt_length = _circuit_path(G_opt, start_key)
+        result["optimal"] = {"path": opt_path, "length_m": opt_length}
 
-    G_both = _to_directed_both_curbs(G)
-    both_path, both_length = _circuit_path_directed(G_both, start_key)
+    if need_naive:
+        G_naive = _eulerize_naive(G)
+        naive_path, naive_length = _circuit_path(G_naive, start_key)
+        result["naive"] = {"path": naive_path, "length_m": naive_length}
 
-    return {
-        "original_length_m": original_length,
-        "num_streets": num_streets,
-        "optimal": {"path": opt_path, "length_m": opt_length},
-        "naive": {"path": naive_path, "length_m": naive_length},
-        "both_curbs": {"path": both_path, "length_m": both_length},
-    }
+    if need_both_curbs:
+        G_both = _to_directed_both_curbs(G)
+        both_path, both_length = _circuit_path_directed(G_both, start_key)
+        result["both_curbs"] = {"path": both_path, "length_m": both_length}
+
+    return result
 
 
 def solve_route_inspection(

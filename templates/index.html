@@ -158,6 +158,29 @@
       <div style="margin-top:10px;">
         <div class="toggle-row"><span><span class="swatch" style="background:var(--base-color);"></span><span id="baseLabel">Baseline</span></span><input type="checkbox" id="toggleBase" checked/></div>
         <div id="fleetLegend"></div>
+        <div class="toggle-row" id="toggleRandomRow" style="display:none;">
+          <span><span class="swatch" style="background:#8a8f99;"></span>Random sweeping (no planning) — ghost overlay</span>
+          <input type="checkbox" id="toggleRandomFleet"/>
+        </div>
+        <div id="fleetCompareBlock" style="display:none; margin-top:8px; padding:8px; border:1px solid var(--border); border-radius:8px; background:#10202b; font-size:12px; line-height:1.5;"></div>
+        <div class="row" id="batchCompareRow" style="display:none; margin-top:8px;">
+          <button id="btnBatchCompare" style="flex:1;">📊 Random vs. Q-ELM distribution (30 draws)</button>
+        </div>
+        <div class="status" id="batchCompareStatus" style="display:none; margin-top:6px;"></div>
+        <div id="batchChartWrap" style="display:none; margin-top:10px; background:#10202b; border:1px solid var(--border); border-radius:8px; padding:8px; text-align:center;">
+          <a id="batchChartLink" target="_blank" rel="noopener">
+            <img id="batchChartImg" style="width:100%; border-radius:6px; cursor:zoom-in; display:block;" alt="Random sweeping vs. Q-ELM distribution chart" />
+          </a>
+          <div class="hint" style="margin-top:6px;">Click the chart to open it full-size in a new tab.</div>
+        </div>
+        <div id="savingsBlock" style="display:none; margin-top:10px; padding:10px; border:1px solid var(--border); border-radius:8px; background:#10202b;">
+          <div style="font-weight:600; margin-bottom:6px; color:var(--text); font-size:12.5px;">Estimated cost savings from fleet balancing</div>
+          <label>Cost per km driven (₹): <span class="val" id="costPerKmVal">18</span></label>
+          <input type="range" id="costPerKmSlider" min="1" max="100" step="1" value="18" style="width:100%;" />
+          <label style="margin-top:8px;">Sweeps per month: <span class="val" id="sweepsPerMonthVal">30</span></label>
+          <input type="range" id="sweepsPerMonthSlider" min="1" max="120" step="1" value="30" style="width:100%;" />
+          <div id="savingsSummary" style="margin-top:8px; font-size:12px; line-height:1.6;"></div>
+        </div>
       </div>
       <div class="row" style="margin-top:6px;">
         <select id="animSelect" style="flex:1;"></select>

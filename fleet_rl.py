@@ -48,6 +48,7 @@ that does (the shortest walk covering it).
 
 from __future__ import annotations
 
+import random as _random
 import time as _time
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
@@ -376,7 +377,7 @@ def _routed_makespan(G: nx.MultiGraph, edges_by_vehicle: List[List[EdgeKey]]) ->
             sub.add_node(u, **G.nodes[u])
             sub.add_node(v, **G.nodes[v])
             sub.add_edge(u, v, key=key, **data)
-        result = solve_circuit(sub)
+        result = solve_circuit(sub, need_naive=False, need_both_curbs=False)
         lengths.append(result["optimal"]["length_m"] if result else 0.0)
     return (max(lengths) if lengths else 0.0), lengths
 
@@ -468,6 +469,48 @@ def train_fleet_assignment(
     )
 
 
+def random_fleet_assignment(G: nx.MultiGraph, k: int, seed: int = 20260827) -> FleetAssignment:
+    """Baseline for live, on-screen comparison: every street edge is thrown
+    to one of the k vehicles completely at random, with no notion of
+    geography, contiguity, or fairness at all — this is what "random
+    sweeping" looks like with zero planning. Each vehicle's random chunk is
+    still handed to the exact Route Inspection solver, so the only thing
+    this measures is how bad the *assignment* is, not the routing. Exists
+    purely so a demo can show a concrete, real "before vs. after" distance
+    saved by fleet balancing, rather than asserting the improvement in the
+    abstract. A fixed default seed keeps the comparison reproducible across
+    repeated plans of the same area."""
+    t0 = _time.time()
+    k = max(1, min(k, MAX_VEHICLES))
+    rng = _random.Random(seed)
+    edges = list(G.edges(keys=True))
+    assigned: List[List[EdgeKey]] = [[] for _ in range(k)]
+    for e in edges:
+        assigned[rng.randrange(k)].append(e)
+    dist_by_vehicle = [
+        sum(G.get_edge_data(u, v, key)["weight"] for (u, v, key) in edges_i)
+        for edges_i in assigned
+    ]
+    # Every caller of this function re-solves each vehicle's real route via
+    # build_vehicle_routes() anyway (to get an actual path to draw/animate),
+    # and derives its own makespan from those real, solved lengths — this
+    # dataclass's makespan_m field is never read downstream. So skip the
+    # expensive routed solve (_routed_makespan calls the exact CPP solver,
+    # including minimum-weight matching, once per vehicle) here and use the
+    # free raw territory-weight max instead; it costs nothing extra and
+    # avoids solving every vehicle's circuit twice for a number nobody uses.
+    makespan_m = max(dist_by_vehicle) if dist_by_vehicle else 0.0
+    train_ms = (_time.time() - t0) * 1000.0
+    return FleetAssignment(
+        edges_by_vehicle=assigned,
+        dist_by_vehicle=dist_by_vehicle,
+        makespan_m=makespan_m,
+        episodes_run=0,
+        train_ms=train_ms,
+        history=[],
+    )
+
+
 def build_vehicle_routes(
     G: nx.MultiGraph, assignment: FleetAssignment, start_latlng=None, both_curbs: bool = False
 ) -> List[dict]:
@@ -498,7 +541,12 @@ def build_vehicle_routes(
             sub.add_node(u, **G.nodes[u])
             sub.add_node(v, **G.nodes[v])
             sub.add_edge(u, v, key=key, **data)
-        result = solve_circuit(sub, this_start)
+        # Only ever one of these two is actually used below — request just
+        # that one so solve_circuit skips the other entirely. This matters
+        # a lot for both_curbs=True (the app's default): that variant needs
+        # no matching at all, so this avoids running the expensive
+        # min-weight-matching "optimal" solve for every vehicle for nothing.
+        result = solve_circuit(sub, this_start, need_optimal=not both_curbs, need_naive=False, need_both_curbs=both_curbs)
         if result is None:
             vehicles.append({"path": [], "lengthM": 0.0, "steps": 0})
         else:
