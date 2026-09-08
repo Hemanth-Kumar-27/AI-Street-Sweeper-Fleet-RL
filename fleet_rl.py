@@ -48,8 +48,10 @@ that does (the shortest walk covering it).
 
 from __future__ import annotations
 
+import os as _os
 import random as _random
 import time as _time
+from concurrent.futures import ProcessPoolExecutor as _ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
@@ -382,6 +384,22 @@ def _routed_makespan(G: nx.MultiGraph, edges_by_vehicle: List[List[EdgeKey]]) ->
     return (max(lengths) if lengths else 0.0), lengths
 
 
+def _restart_worker(args):
+    """One full restart (seed-partition + Q-ELM training + real routed
+    -makespan scoring), packaged as a single picklable, top-level call so it
+    can be run in a separate process. Restarts share no state with each
+    other, so running them in parallel instead of one after another changes
+    nothing about the result -- train_fleet_assignment still compares every
+    restart's routed makespan in the same fixed order and keeps the same
+    winner it would have sequentially; only the wall-clock time changes."""
+    G, k, start_nodes, episodes, hidden_dim, restart_seed, max_transfers, r = args
+    assigned, dist_by_vehicle, train_makespan, history = _train_one_restart(
+        G, k, start_nodes, episodes, hidden_dim, restart_seed, max_transfers
+    )
+    routed_makespan, _routed_lengths = _routed_makespan(G, assigned)
+    return r, assigned, dist_by_vehicle, train_makespan, routed_makespan, history
+
+
 def train_fleet_assignment(
     G: nx.MultiGraph,
     k: int,
@@ -432,23 +450,52 @@ def train_fleet_assignment(
     nodes = list(G.nodes)
     picker_rng = np.random.default_rng(seed)
 
-    best_assigned = None
-    best_dist = None
-    best_routed_makespan = float("inf")
-    restart_history = []
-
+    # Decide every restart's starting nodes up front, sequentially, so the
+    # picker_rng draw order — and therefore which starting shape each
+    # restart gets — is identical to running restarts one at a time. Only
+    # the independent training/scoring work below (which shares no state
+    # between restarts) is actually parallelized.
+    restart_args = []
     for r in range(num_restarts):
         if r == 0 or len(nodes) <= k:
             start_nodes = _pick_start_nodes(G, k)
         else:
             first_node = nodes[int(picker_rng.integers(len(nodes)))]
             start_nodes = _pick_start_nodes(G, k, first_node=first_node)
-
         restart_seed = seed + r * 7919  # distinct, deterministic per restart
-        assigned, dist_by_vehicle, train_makespan, history = _train_one_restart(
-            G, k, start_nodes, episodes, hidden_dim, restart_seed, max_transfers
-        )
-        routed_makespan, _routed_lengths = _routed_makespan(G, assigned)
+        restart_args.append((G, k, start_nodes, episodes, hidden_dim, restart_seed, max_transfers, r))
+
+    # Restarts are embarrassingly parallel (each trains its own ELM from its
+    # own seed partition, with no shared state) — run them across processes
+    # when there's more than one to do and more than one CPU to do it with,
+    # falling back to the original sequential loop if that ever fails for
+    # any reason (e.g. an environment that disallows subprocesses). Either
+    # way, results are combined below in the same fixed restart order as
+    # before, so which restart "wins" is unaffected by execution order.
+    results = [None] * num_restarts
+    max_workers = min(num_restarts, _os.cpu_count() or 1)
+    ran_in_parallel = False
+    if max_workers > 1:
+        try:
+            with _ProcessPoolExecutor(max_workers=max_workers) as ex:
+                for r, assigned, dist_by_vehicle, train_makespan, routed_makespan, history in ex.map(
+                    _restart_worker, restart_args
+                ):
+                    results[r] = (assigned, dist_by_vehicle, train_makespan, routed_makespan, history)
+            ran_in_parallel = True
+        except Exception:
+            ran_in_parallel = False
+    if not ran_in_parallel:
+        for args in restart_args:
+            r, assigned, dist_by_vehicle, train_makespan, routed_makespan, history = _restart_worker(args)
+            results[r] = (assigned, dist_by_vehicle, train_makespan, routed_makespan, history)
+
+    best_assigned = None
+    best_dist = None
+    best_routed_makespan = float("inf")
+    restart_history = []
+    for r in range(num_restarts):
+        assigned, dist_by_vehicle, train_makespan, routed_makespan, history = results[r]
         restart_history.append({
             "restart": r,
             "train_makespan_m": train_makespan,

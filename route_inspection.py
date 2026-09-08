@@ -51,6 +51,7 @@ import math
 from typing import List, Optional, Sequence, Tuple
 
 import networkx as nx
+import numpy as np
 
 from geo import make_projector, point_in_polygon
 
@@ -107,38 +108,45 @@ def bridge_components(G: nx.MultiGraph) -> nx.MultiGraph:
     the shortest possible connector edges (nearest-node-to-nearest-node)
     until the whole graph is traversable in one route. Marked with
     transit=True so the frontend can render them distinctly (a real vehicle
-    driving a short unmapped/disconnected link)."""
+    driving a short unmapped/disconnected link).
+
+    The nearest-pair search below is the exact same "cheap planar approx"
+    distance used before (raw lat/lng hypot, picking the true minimum over
+    every merged-node/other-node pair) -- it's just done as one vectorized
+    numpy distance-matrix computation per candidate component instead of a
+    pure-Python double loop, so the chosen bridge (and therefore the whole
+    route) is identical, only faster on real OSM extracts that fragment
+    into many small disconnected pieces."""
     G = G.copy()
-    comps = [set(c) for c in nx.connected_components(G)]
+    comps = [list(c) for c in nx.connected_components(G)]
     if len(comps) <= 1:
         return G
 
-    def node_dist(a, b):
-        (ax, ay) = G.nodes[a]["latlng"]
-        (bx, by) = G.nodes[b]["latlng"]
-        # cheap planar approx good enough for picking the nearest bridge
-        return math.hypot(ax - bx, ay - by)
+    coords = {n: G.nodes[n]["latlng"] for n in G.nodes}
 
     comps.sort(key=len, reverse=True)
-    merged = comps[0]
-    remaining = comps[1:]
+    merged: List = list(comps[0])
+    remaining: List[List] = [list(c) for c in comps[1:]]
     while remaining:
+        merged_xy = np.array([coords[n] for n in merged], dtype=np.float64)
         best = None  # (dist, node_in_merged, node_in_other, other_idx)
         for idx, comp in enumerate(remaining):
-            for a in merged:
-                for b in comp:
-                    d = node_dist(a, b)
-                    if best is None or d < best[0]:
-                        best = (d, a, b, idx)
+            comp_xy = np.array([coords[n] for n in comp], dtype=np.float64)
+            diff = merged_xy[:, None, :] - comp_xy[None, :, :]
+            d2 = np.einsum("ijk,ijk->ij", diff, diff)
+            i, j = np.unravel_index(int(np.argmin(d2)), d2.shape)
+            d = math.sqrt(float(d2[i, j]))
+            if best is None or d < best[0]:
+                best = (d, merged[i], comp[j], idx)
         _, a, b, idx = best
-        (alat, alng) = G.nodes[a]["latlng"]
-        (blat, blng) = G.nodes[b]["latlng"]
+        (alat, alng) = coords[a]
+        (blat, blng) = coords[b]
         ref_lat = (alat + blat) / 2
         to_xy, _ = make_projector(ref_lat)
         x1, y1 = to_xy(alat, alng)
         x2, y2 = to_xy(blat, blng)
         G.add_edge(a, b, weight=math.hypot(x2 - x1, y2 - y1), transit=True)
-        merged |= remaining.pop(idx)
+        merged.extend(remaining.pop(idx))
     return G
 
 
@@ -159,6 +167,14 @@ def _eulerize_min(G: nx.MultiGraph) -> nx.MultiGraph:
     # at once) instead of one Dijkstra per PAIR of odd nodes — O(k) full
     # searches instead of O(k^2) targeted ones, which matters once a real
     # street network has a few hundred dead-ends/T-junctions.
+    #
+    # (A target-limited early-stopping variant was tried here and verified
+    # exactly correct, but benchmarked no faster — and sometimes slightly
+    # slower — on this project's own grid-shaped test networks, where the
+    # odd-degree nodes are the whole perimeter rather than a small, localized
+    # minority, so early-stopping rarely triggers before most of the graph
+    # is explored anyway. Kept as the plain networkx call since it's no
+    # slower here and simpler.)
     odd_set = set(odd)
     Gp = nx.Graph()
     for m in odd:
